@@ -1,266 +1,136 @@
 #!/usr/bin/env python3
-# Description: Builds a standalone copy of binutils
+# pylint: disable=invalid-name
 
-import argparse
-import multiprocessing
-import os
-import pathlib
-import platform
-import shutil
-import subprocess
-import utils
+from argparse import ArgumentParser
+from pathlib import Path
+import time
 
+import tc_build.binutils
+import tc_build.utils
 
-def host_arch_target():
-    """
-    Converts the host architecture to the first part of a target triple
-    :return: Target host
-    """
-    host_mapping = {
-        "armv7l": "arm",
-        "ppc64": "powerpc64",
-        "ppc64le": "powerpc64le",
-        "ppc": "powerpc"
-    }
-    machine = platform.machine()
-    return host_mapping.get(machine, machine)
+LATEST_BINUTILS_RELEASE = (2, 42, 0)
 
+parser = ArgumentParser()
+parser.add_argument('-B',
+                    '--binutils-folder',
+                    help='''
+                    By default, the script will download a copy of the binutils source in the src folder within
+                    the same folder as this script. If you have your own copy of the binutils source that you
+                    would like to build from, pass it to this parameter. It can be either an absolute or
+                    relative path.
+                    ''',
+                    type=str)
+parser.add_argument('-b',
+                    '--build-folder',
+                    help='''
+                    By default, the script will create a "build/binutils" folder in the same folder as this
+                    script then build each target in its own folder within that containing folder. If you
+                    would like the containing build folder to be somewhere else, pass it to this parameter.
+                    that done somewhere else, pass it to this parameter. It can be either an absolute or
+                    relative path.
+                    ''',
+                    type=str)
+parser.add_argument('-i',
+                    '--install-folder',
+                    help='''
+                    By default, the script will build binutils but stop before installing it. To install
+                    them into a prefix, pass it to this parameter. This can be either an absolute or
+                    relative path.
+                    ''',
+                    type=str)
+parser.add_argument('-m',
+                    '--march',
+                    metavar='ARCH',
+                    help='''
+                    Add -march=ARCH to CFLAGS to optimize the toolchain for the processor that it will be
+                    running on.
+                    ''',
+                    type=str)
+parser.add_argument('--show-build-commands',
+                    help='''
+                    By default, the script only shows the output of the comands it is running. When this option
+                    is enabled, the invocations of configure and make will be shown to help with reproducing
+                    issues outside of the script.
+                    ''',
+                    action='store_true')
+parser.add_argument('-t',
+                    '--targets',
+                    help='''
+                    The script can build binutils targeting arm-linux-gnueabi, aarch64-linux-gnu,
+                    mips-linux-gnu, mipsel-linux-gnu, powerpc-linux-gnu, powerpc64-linux-gnu,
+                    powerpc64le-linux-gnu, riscv64-linux-gnu, s390x-linux-gnu, and x86_64-linux-gnu.
 
-def target_arch(target):
-    """
-    Returns the architecture from a target triple
-    :param target: Triple to deduce architecture from
-    :return: Architecture associated with given triple
-    """
-    return target.split("-")[0]
+                    By default, it builds all supported targets ("all"). If you would like to build
+                    specific targets only, pass them to this script. It can be either the full target
+                    or just the first part (arm, aarch64, x86_64, etc).
+                    ''',
+                    nargs='+')
+args = parser.parse_args()
 
+script_start = time.time()
 
-def host_is_target(target):
-    """
-    Checks if the current target triple the same as the host.
-    :param target: Triple to match host architecture against
-    :return: True if host and target are same, False otherwise
-    """
-    return host_arch_target() == target_arch(target)
+tc_build_folder = Path(__file__).resolve().parent
 
+bsm = tc_build.binutils.BinutilsSourceManager()
+if args.binutils_folder:
+    bsm.location = Path(args.binutils_folder).resolve()
+    if not bsm.location.exists():
+        raise RuntimeError(f"Provided binutils source ('{bsm.location}') does not exist?")
+else:
+    # Turns (2, 40, 0) into 2.40 and (2, 40, 1) into 2.40.1 to follow tarball names
+    folder_name = 'binutils-' + '.'.join(str(x) for x in LATEST_BINUTILS_RELEASE if x)
 
-def parse_parameters(root_folder):
-    """
-    Parses parameters passed to the script into options
-    :param root_folder: The directory where the script is being invoked from
-    :return: A 'Namespace' object with all the options parsed from supplied parameters
-    """
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-B",
-                        "--build-folder",
-                        help="""
-                        By default, the script will create a "build" folder in the same folder as this script,
-                        then a "binutils" folder within that one and build the files there. If you would like
-                        that done somewhere else, pass it to this parameter. This can either be an absolute
-                        or relative path.
-                        """,
-                        type=str,
-                        default=os.path.join(root_folder.as_posix(), "build",
-                                             "binutils"))
-    parser.add_argument("-I",
-                        "--install-folder",
-                        help="""
-                        By default, the script will create an "install" folder in the same folder as this script
-                        and install binutils there. If you'd like to have it installed somewhere else, pass
-                        it to this parameter. This can either be an absolute or relative path.
-                        """,
-                        type=str,
-                        default=os.path.join(root_folder.as_posix(),
-                                             "install"))
-    parser.add_argument("-t",
-                        "--targets",
-                        help="""
-                        The script can build binutils targeting arm-linux-gnueabi, aarch64-linux-gnu,
-                        mipsel-linux-gnu, powerpc-linux-gnu, powerpc64-linux-gnu, powerpc64le-linux-gnu,
-                        riscv64-linux-gnu, s390x-linux-gnu, and x86_64-linux-gnu.
+    bsm.location = Path(tc_build_folder, 'src', folder_name)
+    bsm.tarball.base_download_url = 'https://sourceware.org/pub/binutils/releases'
+    bsm.tarball.local_location = bsm.location.with_name(f"{folder_name}.tar.xz")
+    bsm.tarball_remote_checksum_name = 'sha512.sum'
+    bsm.prepare()
 
-                        You can either pass the full target or just the first part (arm, aarch64, x86_64, etc)
-                        or all if you want to build all targets (which is the default). It will only add the
-                        target prefix if it is not for the host architecture.
-                        """,
-                        nargs="+")
-    parser.add_argument("-m",
-                        "--march",
-                        metavar="ARCH",
-                        help="""
-                        Add -march=ARCH and -mtune=ARCH to CFLAGS to optimize the toolchain for the target
-                        host processor.
-                        """,
-                        type=str)
-    return parser.parse_args()
+if args.build_folder:
+    build_folder = Path(args.build_folder).resolve()
+else:
+    build_folder = Path(tc_build_folder, 'build/binutils')
 
+default_targets = bsm.default_targets()
+if args.targets:
+    targets = default_targets if 'all' in args.targets else set(args.targets)
+else:
+    targets = default_targets
 
-def create_targets(targets):
-    """
-    Generate a list of targets that can be passed to the binutils compile function
-    :param targets: A list of targets to convert to binutils target triples
-    :return: A list of target triples
-    """
-    targets_dict = {
-        "arm": "arm-linux-gnueabi",
-        "aarch64": "aarch64-linux-gnu",
-        "mips": "mips-linux-gnu",
-        "mipsel": "mipsel-linux-gnu",
-        "powerpc64": "powerpc64-linux-gnu",
-        "powerpc64le": "powerpc64le-linux-gnu",
-        "powerpc": "powerpc-linux-gnu",
-        "riscv64": "riscv64-linux-gnu",
-        "s390x": "s390x-linux-gnu",
-        "x86_64": "x86_64-linux-gnu"
-    }
-
-    targets_set = set()
-    for target in targets:
-        if target == "all":
-            return list(targets_dict.values())
-        elif target == "host":
-            key = host_arch_target()
-        else:
-            key = target_arch(target)
-        targets_set.add(targets_dict[key])
-
-    return list(targets_set)
-
-
-def cleanup(build_folder):
-    """
-    Cleanup the build directory
-    :param build_folder: Build directory
-    """
-    if build_folder.is_dir():
-        shutil.rmtree(build_folder.as_posix())
-    build_folder.mkdir(parents=True, exist_ok=True)
-
-
-def invoke_configure(build_folder, install_folder, root_folder, target,
-                     host_arch):
-    """
-    Invokes the configure script to generate a Makefile
-    :param build_folder: Build directory
-    :param install_folder: Directory to install binutils to
-    :param root_folder: Working directory
-    :param target: Target to compile for
-    :param host_arch: Host architecture to optimize for
-    """
-    configure = [
-        root_folder.joinpath(utils.current_binutils(), "configure").as_posix(),
-        'CC=gcc', 'CXX=g++', '--disable-compressed-debug-sections',
-        '--disable-gdb', '--disable-werror', '--enable-deterministic-archives',
-        '--enable-new-dtags', '--enable-plugins', '--enable-threads',
-        '--prefix=%s' % install_folder.as_posix(), '--quiet',
-        '--with-system-zlib'
-    ]
-    if host_arch:
-        configure += [
-            'CFLAGS=-O2 -march=%s -mtune=%s' % (host_arch, host_arch),
-            'CXXFLAGS=-O2 -march=%s -mtune=%s' % (host_arch, host_arch)
-        ]
+targets_to_builder = {
+    'arm': tc_build.binutils.ArmBinutilsBuilder,
+    'aarch64': tc_build.binutils.AArch64BinutilsBuilder,
+    'mips': tc_build.binutils.MipsBinutilsBuilder,
+    'mipsel': tc_build.binutils.MipselBinutilsBuilder,
+    'powerpc': tc_build.binutils.PowerPCBinutilsBuilder,
+    'powerpc64': tc_build.binutils.PowerPC64BinutilsBuilder,
+    'powerpc64le': tc_build.binutils.PowerPC64LEBinutilsBuilder,
+    'riscv64': tc_build.binutils.RISCV64BinutilsBuilder,
+    's390x': tc_build.binutils.S390XBinutilsBuilder,
+    'x86_64': tc_build.binutils.X8664BinutilsBuilder,
+}
+if 'loongarch64' in default_targets:
+    targets_to_builder['loongarch64'] = tc_build.binutils.LoongArchBinutilsBuilder
+for item in targets:
+    target = item.split('-', maxsplit=1)[0]
+    if target in targets_to_builder:
+        builder = targets_to_builder[target]()
+        builder.folders.build = Path(build_folder, target)
+        if args.install_folder:
+            builder.folders.install = Path(args.install_folder).resolve()
+        builder.folders.source = bsm.location
+        if args.march:
+            builder.cflags.append(f"-march={args.march}")
+            # -march implies -mtune except for x86-64-v{2,3,4}, which are
+            # documented to imply -mtune=generic. If the user has requested one
+            # of these values, it is a safe assumption they only care about
+            # running on their machine, so add -mtune=native to further
+            # optimize the toolchain for their machine.
+            if 'x86-64-v' in args.march:
+                builder.cflags.append('-mtune=native')
+        builder.show_commands = args.show_build_commands
+        builder.build()
     else:
-        configure += ['CFLAGS=-O2', 'CXXFLAGS=-O2']
+        tc_build.utils.print_warning(f"Unsupported target ('{target}'), ignoring...")
 
-    configure_arch_flags = {
-        "arm-linux-gnueabi": [
-            '--disable-multilib', '--disable-nls', '--with-gnu-as',
-            '--with-gnu-ld'
-        ],
-        "powerpc-linux-gnu":
-        ['--disable-sim', '--enable-lto', '--enable-relro', '--with-pic'],
-    }
-    configure_arch_flags['aarch64-linux-gnu'] = configure_arch_flags[
-        'arm-linux-gnueabi'] + ['--enable-gold', '--enable-ld=default']
-    configure_arch_flags['powerpc64-linux-gnu'] = configure_arch_flags[
-        'powerpc-linux-gnu']
-    configure_arch_flags['powerpc64le-linux-gnu'] = configure_arch_flags[
-        'powerpc-linux-gnu']
-    configure_arch_flags['riscv64-linux-gnu'] = configure_arch_flags[
-        'powerpc-linux-gnu']
-    configure_arch_flags['s390x-linux-gnu'] = configure_arch_flags[
-        'powerpc-linux-gnu'] + ['--enable-targets=s390-linux-gnu']
-    configure_arch_flags['x86_64-linux-gnu'] = configure_arch_flags[
-        'powerpc-linux-gnu'] + ['--enable-targets=x86_64-pep']
-
-    for endian in ["", "el"]:
-        configure_arch_flags['mips%s-linux-gnu' % (endian)] = [
-            '--enable-targets=mips64%s-linux-gnuabi64,mips64%s-linux-gnuabin32'
-            % (endian, endian)
-        ]
-
-    configure += configure_arch_flags.get(target, [])
-
-    # If the current machine is not the target, add the prefix to indicate
-    # that it is a cross compiler
-    if not host_is_target(target):
-        configure += ['--program-prefix=%s-' % target, '--target=%s' % target]
-
-    utils.print_header("Building %s binutils" % target)
-    subprocess.run(configure, check=True, cwd=build_folder.as_posix())
-
-
-def invoke_make(build_folder, install_folder, target):
-    """
-    Invoke make to compile binutils
-    :param build_folder: Build directory
-    :param install_folder: Directory to install binutils to
-    :param target: Target to compile for
-    """
-    make = ['make', '-s', '-j' + str(multiprocessing.cpu_count()), 'V=0']
-    if host_is_target(target):
-        subprocess.run(make + ['configure-host'],
-                       check=True,
-                       cwd=build_folder.as_posix())
-    subprocess.run(make, check=True, cwd=build_folder.as_posix())
-    subprocess.run(make + ['prefix=%s' % install_folder.as_posix(), 'install'],
-                   check=True,
-                   cwd=build_folder.as_posix())
-    with install_folder.joinpath(".gitignore").open("w") as gitignore:
-        gitignore.write("*")
-
-
-def build_targets(build, install_folder, root_folder, targets, host_arch):
-    """
-    Builds binutils for all specified targets
-    :param build: Build directory
-    :param install_folder: Directory to install binutils to
-    :param root_folder: Working directory
-    :param targets: Targets to compile binutils for
-    :param host_arch: Host architecture to optimize for
-    :return:
-    """
-    for target in targets:
-        build_folder = build.joinpath(target)
-        cleanup(build_folder)
-        invoke_configure(build_folder, install_folder, root_folder, target,
-                         host_arch)
-        invoke_make(build_folder, install_folder, target)
-
-
-def main():
-    root_folder = pathlib.Path(__file__).resolve().parent
-
-    args = parse_parameters(root_folder)
-
-    build_folder = pathlib.Path(args.build_folder)
-    if not build_folder.is_absolute():
-        build_folder = root_folder.joinpath(build_folder)
-
-    install_folder = pathlib.Path(args.install_folder)
-    if not install_folder.is_absolute():
-        install_folder = root_folder.joinpath(install_folder)
-
-    targets = ["all"]
-    if args.targets is not None:
-        targets = args.targets
-
-    utils.download_binutils(root_folder)
-
-    build_targets(build_folder, install_folder, root_folder,
-                  create_targets(targets), args.march)
-
-
-if __name__ == '__main__':
-    main()
+print(f"\nTotal script duration: {tc_build.utils.get_duration(script_start)}")

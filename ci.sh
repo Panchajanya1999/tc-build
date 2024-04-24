@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 
-BASE=$(dirname "$(readlink -f "${0}")")
+base=$(dirname "$(readlink -f "$0")")
+install=$base/install
+src=$base/src
 
 set -eu
 
 function parse_parameters() {
-    while ((${#})); do
-        case ${1} in
-            all | binutils | deps | kernel | llvm) ACTION=${1} ;;
+    while (($#)); do
+        case $1 in
+            all | binutils | deps | kernel | llvm) action=$1 ;;
             *) exit 33 ;;
         esac
         shift
@@ -22,12 +24,16 @@ function do_all() {
 }
 
 function do_binutils() {
-    "${BASE}"/build-binutils.py -t x86_64
+    "$base"/build-binutils.py \
+        --install-folder "$install" \
+        --show-build-commands \
+        --targets x86_64
 }
 
 function do_deps() {
     # We only run this when running on GitHub Actions
     [[ -z ${GITHUB_ACTIONS:-} ]] && return 0
+
     sudo apt-get install -y --no-install-recommends \
         bc \
         bison \
@@ -52,24 +58,55 @@ function do_deps() {
 }
 
 function do_kernel() {
-    cd "${BASE}"/kernel
-    ./build.sh -t X86
+    local branch=linux-rolling-stable
+    local linux=$src/$branch
+
+    if [[ -d $linux ]]; then
+        git -C "$linux" fetch --depth=1 origin $branch
+        git -C "$linux" reset --hard FETCH_HEAD
+    else
+        git clone \
+            --branch "$branch" \
+            --depth=1 \
+            --single-branch \
+            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+            "$linux"
+    fi
+
+    cat <<EOF | env PYTHONPATH="$base"/tc_build python3 -
+from pathlib import Path
+
+from kernel import LLVMKernelBuilder
+
+builder = LLVMKernelBuilder()
+builder.folders.build = Path('$base/build/linux')
+builder.folders.source = Path('$linux')
+builder.matrix = {'defconfig': ['X86']}
+builder.toolchain_prefix = Path('$install')
+
+builder.build()
+EOF
 }
 
 function do_llvm() {
-    EXTRA_ARGS=()
-    [[ -n ${GITHUB_ACTIONS:-} ]] && EXTRA_ARGS+=(--no-ccache)
-    "${BASE}"/build-llvm.py \
+    extra_args=()
+    [[ -n ${GITHUB_ACTIONS:-} ]] && extra_args+=(--no-ccache)
+
+    "$base"/build-llvm.py \
         --assertions \
-        --branch "release/13.x" \
         --build-stage1-only \
+        --build-target distribution \
         --check-targets clang lld llvm \
-        --install-stage1-only \
-        --projects "clang;lld" \
+        --install-folder "$install" \
+        --install-target distribution \
+        --projects clang lld \
+        --quiet-cmake \
+        --ref release/17.x \
         --shallow-clone \
+        --show-build-commands \
         --targets X86 \
-        "${EXTRA_ARGS[@]}"
+        "${extra_args[@]}"
 }
 
-parse_parameters "${@}"
-do_"${ACTION:=all}"
+parse_parameters "$@"
+do_"${action:=all}"
